@@ -1,13 +1,16 @@
 {
   "name": "folium",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "A lightweight browser-based workspace for inspecting datasets created through AI-assisted research.",
   "private": true,
   "scripts": {
     "dev": "next dev",
     "build": "next build",
     "start": "next start",
-    "lint": "eslint"
+    "lint": "eslint",
+    "test": "node --test tests/*.test.cjs",
+    "release:version": "node scripts/release-version.cjs",
+    "release:check": "node scripts/release-version.cjs --check"
   },
   "dependencies": {
     "@base-ui/react": "^1.8.0",
