@@ -94,15 +94,23 @@ type IconPickerProps = {
   columnLabel: string;
   iconName?: string;
   onIconChange: (iconName: string) => void;
+  synonyms?: string[];
+  onSynonymsAdd?: (synonyms: string[]) => void;
+  onReset?: () => void;
 };
 
 export function IconPicker({
   columnLabel,
   iconName = DEFAULT_ICON_NAME,
   onIconChange,
+  synonyms = [],
+  onSynonymsAdd,
+  onReset,
 }: IconPickerProps) {
   const [open, setOpen] = useState(false);
   const [query, setQuery] = useState("");
+  const [synonymDraft, setSynonymDraft] = useState("");
+  const [synonymSaved, setSynonymSaved] = useState(false);
   const searchInputRef = useRef<HTMLInputElement>(null);
   const selectedEntry = getIconEntry(iconName);
 
@@ -129,6 +137,8 @@ export function IconPicker({
 
     if (nextOpen) {
       setQuery("");
+      setSynonymDraft("");
+      setSynonymSaved(false);
     }
   }
 
@@ -210,6 +220,38 @@ export function IconPicker({
                 </div>
               )}
             </div>
+            {onSynonymsAdd && (
+              <form
+                className="mt-2 space-y-2 border-t border-border px-2 py-2"
+                onSubmit={(event) => {
+                  event.preventDefault();
+                  const additions = synonymDraft.split(",").map((value) => value.trim()).filter(Boolean);
+                  if (!additions.length) return;
+                  onSynonymsAdd(additions);
+                  setSynonymDraft("");
+                  setSynonymSaved(true);
+                }}
+              >
+                <p className="text-xs text-muted-foreground">Icon choices apply to matching headers across files.</p>
+                {synonyms.length > 0 && <p className="max-h-14 overflow-y-auto text-xs text-muted-foreground">Matches: {synonyms.join(", ")}</p>}
+                <label className="block text-xs" htmlFor={`synonyms-${columnLabel}`}>Add synonyms (comma separated)</label>
+                <div className="flex gap-2">
+                  <input
+                    id={`synonyms-${columnLabel}`}
+                    className="min-w-0 flex-1 rounded-md border border-input bg-background px-2 py-1 text-sm outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                    placeholder="e.g. work contact, office line"
+                    value={synonymDraft}
+                    onChange={(event) => { setSynonymDraft(event.target.value); setSynonymSaved(false); }}
+                  />
+                  <button className="rounded-md bg-accent px-2 py-1 text-xs disabled:opacity-40" disabled={!synonymDraft.trim()} type="submit">Add</button>
+                </div>
+                <p className="text-xs text-muted-foreground">Adding a synonym replaces its previous mapping.</p>
+                <div className="flex items-center justify-between">
+                  <span aria-live="polite" className="text-xs text-muted-foreground">{synonymSaved ? "Synonyms saved" : ""}</span>
+                  {onReset && <button className="text-xs text-muted-foreground underline underline-offset-2" type="button" onClick={() => { onReset(); setOpen(false); }}>Use automatic icon</button>}
+                </div>
+              </form>
+            )}
           </Popover.Popup>
         </Popover.Positioner>
       </Popover.Portal>

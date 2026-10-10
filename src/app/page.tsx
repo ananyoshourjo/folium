@@ -2,6 +2,7 @@
 
 import {
   useEffect,
+  useCallback,
   useMemo,
   useRef,
   useState,
@@ -10,11 +11,15 @@ import {
 } from "react";
 
 import { Button } from "@/components/ui/button";
-import { DEFAULT_ICON_NAME, IconPicker } from "@/components/icon-picker";
+import { Tooltip } from "@base-ui/react/tooltip";
+import { IconPicker } from "@/components/icon-picker";
+import { addHeaderSynonyms, assignHeaderIcon, getHeaderSynonyms, resolveHeaderIcon, getHeaderConcept } from "@/lib/header-icons";
+import { useHeaderIcons } from "@/lib/use-header-icons";
+import { ColumnFilter } from "@/components/column-filter";
+import { describeColumns, deriveView, freshView, type View } from "@/lib/dataset-view";
 
 type CsvRow = string[];
 type ColumnWidths = Record<number, number>;
-type ColumnIcons = Record<number, string>;
 type CsvFileHandle = {
   getFile: () => Promise<File>;
 };
@@ -25,8 +30,9 @@ type ResizeState = {
 };
 
 const MIN_COLUMN_WIDTH = 48;
+const MAX_DEFAULT_COLUMN_WIDTH = 320;
 const SERIAL_COLUMN_WIDTH = 48;
-const HEADER_ICON_SPACE = 28;
+const HEADER_ICON_SPACE = 76;
 const ROW_HEIGHT = 48;
 const OVERSCAN_ROWS = 8;
 type FilePickerWindow = Window & {
@@ -112,8 +118,27 @@ function getWebsiteHref(value: string): string | null {
   try {
     const url = new URL(href);
 
-    if (!url.hostname.includes(".")) {
+    if (url.username || url.password) {
       return null;
+    }
+
+    // Explicit web URLs express intent; bare values need domain validation.
+    // URL parsing alone can normalize numbers like "42" into IPv4 hosts.
+    if (!/^https?:\/\//i.test(trimmedValue)) {
+      const hostname = url.hostname.replace(/\.$/, "");
+      const labels = hostname.split(".");
+      const suffix = labels.at(-1) ?? "";
+
+      if (
+        hostname.length > 253 ||
+        labels.length < 2 ||
+        !labels.every((label) =>
+          /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/i.test(label),
+        ) ||
+        !/^(?:[a-z]{2,63}|xn--[a-z0-9-]{2,59})$/i.test(suffix)
+      ) {
+        return null;
+      }
     }
 
     return href;
@@ -131,12 +156,22 @@ function getFaviconSources(href: string): string[] {
   ];
 }
 
+function isImageUrl(href: string): boolean {
+  return /\.(?:avif|bmp|gif|ico|jpe?g|png|svg|webp)$/i.test(
+    new URL(href).pathname,
+  );
+}
+
 function WebsiteLink({ value, href }: { value: string; href: string }) {
-  const faviconSources = getFaviconSources(href);
+  const imageUrl = isImageUrl(href);
+  const faviconSources = imageUrl
+    ? [href, ...getFaviconSources(href)]
+    : getFaviconSources(href);
   const [faviconIndex, setFaviconIndex] = useState(0);
   const faviconSource = faviconSources[faviconIndex];
+  const [previewFailed, setPreviewFailed] = useState(false);
 
-  return (
+  const link = (
     <a
       className="inline-flex min-w-0 max-w-full items-center gap-1.5 text-primary underline decoration-primary/40 underline-offset-4 transition-[color,text-decoration-color] duration-150 ease-out hover:decoration-primary focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2"
       href={href}
@@ -148,7 +183,8 @@ function WebsiteLink({ value, href }: { value: string; href: string }) {
         <img
           alt=""
           aria-hidden="true"
-          className="h-4 w-4 shrink-0 rounded-none object-contain outline outline-1 outline-black/10"
+          className={`h-4 w-4 shrink-0 rounded-none outline outline-1 outline-black/10 ${imageUrl && faviconIndex === 0 ? "object-cover" : "object-contain"}`}
+          style={imageUrl && faviconIndex === 0 ? { borderRadius: "4px" } : undefined}
           decoding="async"
           height={16}
           loading="lazy"
@@ -163,16 +199,103 @@ function WebsiteLink({ value, href }: { value: string; href: string }) {
       </span>
     </a>
   );
+
+  if (!imageUrl) {
+    return link;
+  }
+
+  return (
+    <Tooltip.Root>
+      <Tooltip.Trigger delay={250} render={link} />
+      <Tooltip.Portal>
+        <Tooltip.Positioner side="top" align="start" sideOffset={8} className="z-50">
+          <Tooltip.Popup className="max-w-[calc(100vw-24px)] overflow-hidden rounded-lg border bg-popover p-2 text-popover-foreground shadow-lg">
+            {previewFailed ? (
+              <p className="px-3 py-6 text-sm text-muted-foreground">Image preview unavailable</p>
+            ) : (
+              // eslint-disable-next-line @next/next/no-img-element
+              <img
+                alt={`Image preview: ${value}`}
+                className="h-64 w-64 max-h-[min(256px,60vh)] max-w-full rounded-sm object-contain"
+                decoding="async"
+                onError={() => setPreviewFailed(true)}
+                referrerPolicy="no-referrer"
+                src={href}
+                height={256}
+                width={256}
+              />
+            )}
+          </Tooltip.Popup>
+        </Tooltip.Positioner>
+      </Tooltip.Portal>
+    </Tooltip.Root>
+  );
 }
 
-function renderCellValue(value: string) {
+const dateDisplayFormatter = new Intl.DateTimeFormat("en-US", {
+  month: "long",
+  day: "2-digit",
+  year: "numeric",
+  timeZone: "UTC",
+});
+
+function formatDateForDisplay(value: string): string {
+  const match = /^(\d{4})-(\d{2})-(\d{2})(T\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?(?:Z|[+-]\d{2}:\d{2})?)?$/.exec(value.trim());
+  if (!match) return value;
+
+  const [, year, month, day, time] = match;
+  const date = new Date(`${year}-${month}-${day}T00:00:00Z`);
+  if (
+    Number.isNaN(date.getTime()) ||
+    date.getUTCFullYear() !== Number(year) ||
+    date.getUTCMonth() + 1 !== Number(month) ||
+    date.getUTCDate() !== Number(day) ||
+    (time && Number.isNaN(Date.parse(value.trim())))
+  ) return value;
+
+  // Format only the visible text; preserve the timestamp's time and offset.
+  return `${dateDisplayFormatter.format(date)}${time ? ` ${time.slice(1)}` : ""}`;
+}
+
+function getHexColor(value: string): string | null {
+  const color = value.trim();
+  return /^#(?:[\da-f]{3}|[\da-f]{4}|[\da-f]{6}|[\da-f]{8})$/i.test(color)
+    ? color
+    : null;
+}
+
+function isFilenameColumn(header: string): boolean {
+  return /^(?:(?:document|image|attachment)\s+)?file[\s_-]*name$/i.test(header.trim());
+}
+
+function renderCellValue(value: string, header = "") {
+  if (value.trim() === "") {
+    return <span className="text-muted-foreground" aria-label="Empty cell">—</span>;
+  }
+  if (isFilenameColumn(header) && !/^https?:\/\//i.test(value.trim())) {
+    return value;
+  }
+  const color = getHexColor(value);
+  if (color) {
+    return (
+      <span className="inline-flex min-w-0 max-w-full items-center gap-1.5">
+        <span
+          aria-hidden="true"
+          className="h-4 w-4 shrink-0"
+          style={{ backgroundColor: color, borderRadius: "4px" }}
+        />
+        <span className="min-w-0 overflow-hidden text-ellipsis whitespace-nowrap">{value}</span>
+      </span>
+    );
+  }
+
   const href = getWebsiteHref(value);
 
   if (!href) {
-    return value;
+    return formatDateForDisplay(value);
   }
 
-  return <WebsiteLink href={href} value={value} />;
+  return <WebsiteLink key={href} href={href} value={value} />;
 }
 
 function getFileSignature(file: File) {
@@ -269,9 +392,10 @@ function measureNaturalColumnWidths(
 
     for (let rowIndex = 1; rowIndex < rows.length; rowIndex += 1) {
       const value = rows[rowIndex][columnIndex] ?? "";
-      const faviconWidth = getWebsiteHref(value) ? 22 : 0;
+      const filename = isFilenameColumn(headerRow[columnIndex] ?? "") && !/^https?:\/\//i.test(value.trim());
+      const faviconWidth = !filename && (getWebsiteHref(value) || getHexColor(value)) ? 22 : 0;
       const width =
-        getMaxLineWidth(context, value) + bodyPadding + faviconWidth;
+        getMaxLineWidth(context, formatDateForDisplay(value)) + bodyPadding + faviconWidth;
 
       widest = Math.max(widest, width);
     }
@@ -279,7 +403,7 @@ function measureNaturalColumnWidths(
     context.font = headerFont;
     naturalWidths[columnIndex] = Math.max(
       MIN_COLUMN_WIDTH,
-      Math.ceil(widest),
+      Math.min(MAX_DEFAULT_COLUMN_WIDTH, Math.ceil(widest)),
     );
   }
 
@@ -316,9 +440,13 @@ export default function Home() {
   const [columnWidths, setColumnWidths] = useState<ColumnWidths>({});
   const [serialColumnWidth, setSerialColumnWidth] =
     useState(SERIAL_COLUMN_WIDTH);
-  const [columnIcons, setColumnIcons] = useState<ColumnIcons>({});
+  const { preferences: headerIconPreferences, update: updateHeaderIcons } = useHeaderIcons();
   const [isResizing, setIsResizing] = useState(false);
   const [rows, setRows] = useState<CsvRow[] | null>(null);
+  const [view, setView] = useState<View>(freshView);
+  const columns = useMemo(() => describeColumns(rows ?? []), [rows]);
+  const displayedRows = useMemo(() => deriveView(rows ?? [], columns, view), [rows, columns, view]);
+  const visibleColumns = columns.filter(c => !view.hidden.includes(c.index)).map(c => c.index);
   const [fileHandle, setFileHandle] = useState<CsvFileHandle | null>(null);
   const [scrollTop, setScrollTop] = useState(0);
   const [viewportHeight, setViewportHeight] = useState(0);
@@ -335,12 +463,11 @@ export default function Home() {
       ) ?? 0,
     [rows],
   );
-  const dataRowCount = Math.max(0, (rows?.length ?? 0) - 1);
+  const dataRowCount = displayedRows.length;
   const bodyScrollTop = Math.max(0, scrollTop - ROW_HEIGHT);
-  const visibleStartIndex = Math.max(
-    0,
-    Math.floor(bodyScrollTop / ROW_HEIGHT) - OVERSCAN_ROWS,
-  );
+  const visibleStartIndex = Math.min(Math.max(0, dataRowCount - 1), Math.max(
+    0, Math.floor(bodyScrollTop / ROW_HEIGHT) - OVERSCAN_ROWS,
+  ));
   const visibleEndIndex = Math.min(
     dataRowCount,
     Math.ceil(
@@ -349,9 +476,7 @@ export default function Home() {
   );
 
   function applyColumnWidth(columnIndex: number, width: number) {
-    const column = columnGroupRef.current?.children[
-      columnIndex + 1
-    ] as HTMLTableColElement | undefined;
+    const column = columnGroupRef.current?.querySelector(`[data-column-index="${columnIndex}"]`) as HTMLTableColElement | undefined;
 
     if (!column) {
       return;
@@ -362,16 +487,16 @@ export default function Home() {
     column.style.width = `${width}px`;
   }
 
-  function applyTableWidth(columnWidths: ColumnWidths) {
+  const applyTableWidth = useCallback((columnWidths: ColumnWidths) => {
     if (!tableRef.current) {
       return;
     }
 
     tableRef.current.style.width = `${getTableWidth(
-      columnWidths,
+      Object.fromEntries(Object.entries(columnWidths).filter(([index]) => !view.hidden.includes(+index))),
       serialColumnWidthRef.current ?? SERIAL_COLUMN_WIDTH,
     )}px`;
-  }
+  }, [view.hidden]);
 
   useEffect(() => {
     function handlePointerMove(event: PointerEvent) {
@@ -428,7 +553,7 @@ export default function Home() {
       window.removeEventListener("pointerup", endResize);
       window.removeEventListener("pointercancel", endResize);
     };
-  }, []);
+  }, [applyTableWidth]);
 
   useEffect(() => {
     if (!rows) {
@@ -574,8 +699,8 @@ export default function Home() {
     setNaturalColumnWidths({});
     setColumnWidths({});
     setSerialColumnWidth(SERIAL_COLUMN_WIDTH);
-    setColumnIcons({});
     setFileHandle(handle);
+    setView(freshView());
     setRows(nextRows);
   }
 
@@ -722,12 +847,13 @@ export default function Home() {
 
     return (
       <main
-        className={`h-svh w-full overflow-hidden bg-background${
+        className={`flex h-svh w-full flex-col overflow-hidden bg-background${
           isResizing ? " cursor-col-resize select-none" : ""
         }`}
       >
+        <input accept=".csv,text/csv" aria-hidden="true" className="hidden" onChange={handleFileChange} ref={fileInputRef} tabIndex={-1} type="file" />
         <div
-          className="h-full w-full overflow-x-auto overflow-y-auto"
+          className="min-h-0 w-full flex-1 overflow-x-auto overflow-y-auto"
           onScroll={handleTableScroll}
           ref={scrollContainerRef}
         >
@@ -740,7 +866,7 @@ export default function Home() {
               hasColumnWidths
                 ? {
                     width: `${getTableWidth(
-                      activeColumnWidths,
+                      Object.fromEntries(Object.entries(activeColumnWidths).filter(([index]) => !view.hidden.includes(+index))),
                       serialColumnWidth,
                     )}px`,
                   }
@@ -760,8 +886,9 @@ export default function Home() {
                       : undefined
                   }
                 />
-                {Array.from({ length: columnCount }, (_, columnIndex) => (
+                {visibleColumns.map((columnIndex) => (
                   <col
+                    data-column-index={columnIndex}
                     key={`column-${columnIndex}`}
                     style={
                       activeColumnWidths[columnIndex] !== undefined
@@ -783,9 +910,9 @@ export default function Home() {
                     aria-hidden="true"
                     className="sticky top-0 border-b border-r border-border bg-muted px-4 py-3 align-top font-medium whitespace-pre last:border-r-0"
                   />
-                  {Array.from({ length: columnCount }, (_, columnIndex) => (
+                  {visibleColumns.map((columnIndex) => (
                     <th
-                      className="sticky top-0 min-w-0 overflow-hidden border-b border-r border-border bg-muted px-4 py-3 align-top font-medium whitespace-pre text-foreground last:border-r-0"
+                      className="group/header sticky top-0 min-w-0 overflow-hidden border-b border-r border-border bg-muted pl-4 pr-2 py-3 align-top font-medium whitespace-pre text-foreground last:border-r-0"
                       data-csv-column={columnIndex}
                       key={`header-${columnIndex}`}
                       scope="col"
@@ -802,22 +929,27 @@ export default function Home() {
                             `column ${columnIndex + 1}`
                           }
                           iconName={
-                            columnIcons[columnIndex] ?? DEFAULT_ICON_NAME
+                            resolveHeaderIcon(headerRow[columnIndex] ?? "", headerIconPreferences)
                           }
                           onIconChange={(nextIconName) =>
-                            setColumnIcons((current) => ({
-                              ...current,
-                              [columnIndex]: nextIconName,
-                            }))
+                            updateHeaderIcons((current) => assignHeaderIcon(headerRow[columnIndex] ?? "", nextIconName, current))
                           }
+                          synonyms={getHeaderSynonyms(headerRow[columnIndex] ?? "", headerIconPreferences)}
+                          onSynonymsAdd={(synonyms) => updateHeaderIcons((current) => addHeaderSynonyms(headerRow[columnIndex] ?? "", synonyms, current))}
+                          onReset={() => updateHeaderIcons((current) => {
+                            const icons = { ...current.icons };
+                            delete icons[getHeaderConcept(headerRow[columnIndex] ?? "", current)];
+                            return { ...current, icons };
+                          })}
                         />
-                        <span className="block min-w-0 overflow-hidden text-ellipsis whitespace-nowrap">
+                        <span className="block min-w-0 flex-1 overflow-hidden text-ellipsis whitespace-nowrap">
                           {headerRow[columnIndex] ?? ""}
                         </span>
+                        <ColumnFilter column={columns[columnIndex]} columns={columns} rows={rows} view={view} onChange={(next) => { setView(next); setScrollTop(0); scrollTopRef.current = 0; if (scrollContainerRef.current) scrollContainerRef.current.scrollTop = 0; }} />
                       </div>
                       <button
                         aria-label={`Resize ${headerRow[columnIndex] || `column ${columnIndex + 1}`} column`}
-                        className="absolute inset-y-0 right-0 z-10 w-3 touch-none cursor-col-resize bg-transparent opacity-0 transition-[opacity,background-color] duration-150 ease-out hover:bg-border/60 hover:opacity-100 focus-visible:opacity-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring"
+                        className="absolute inset-y-0 right-0 z-10 w-1.5 touch-none cursor-col-resize bg-transparent opacity-0 transition-[opacity,background-color] duration-150 ease-out hover:bg-border/60 hover:opacity-100 focus-visible:opacity-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring"
                         onKeyDown={(event) =>
                           handleColumnResizeKeyDown(columnIndex, event)
                         }
@@ -837,7 +969,7 @@ export default function Home() {
                 <tr aria-hidden="true">
                   <td
                     className="border-0 p-0"
-                    colSpan={columnCount + 1}
+                    colSpan={visibleColumns.length + 1}
                     style={{ height: `${visibleStartIndex * ROW_HEIGHT}px` }}
                   />
                 </tr>
@@ -845,8 +977,9 @@ export default function Home() {
               {Array.from(
                 { length: visibleEndIndex - visibleStartIndex },
                 (_, offset) => {
-                  const rowIndex = visibleStartIndex + offset;
-                  const currentRow = rows[rowIndex + 1] ?? [];
+                  const entry = displayedRows[visibleStartIndex + offset];
+                  const rowIndex = entry.sourceIndex;
+                  const currentRow = entry.row;
 
                   return (
                 <tr
@@ -859,14 +992,17 @@ export default function Home() {
                   >
                     {rowIndex + 1}
                   </th>
-                  {Array.from({ length: columnCount }, (_, columnIndex) => (
+                  {visibleColumns.map((columnIndex) => (
                     <td
                       className="min-w-0 overflow-hidden border-b border-r border-border px-4 py-3 align-top text-foreground last:border-r-0"
                       data-csv-cell
                       key={`cell-${rowIndex}-${columnIndex}`}
                     >
-                      <div className="h-5 min-w-0 max-w-full overflow-hidden text-ellipsis whitespace-nowrap">
-                        {renderCellValue(currentRow[columnIndex] ?? "")}
+                      <div
+                        className="h-5 min-w-0 max-w-full overflow-hidden text-ellipsis whitespace-nowrap"
+                        title={currentRow[columnIndex]?.trim() && !isImageUrl(getWebsiteHref(currentRow[columnIndex]) ?? "https://invalid.local") ? currentRow[columnIndex] : undefined}
+                      >
+                        {renderCellValue(currentRow[columnIndex] ?? "", headerRow[columnIndex] ?? "")}
                       </div>
                     </td>
                   ))}
@@ -878,7 +1014,7 @@ export default function Home() {
                 <tr aria-hidden="true">
                   <td
                     className="border-0 p-0"
-                    colSpan={columnCount + 1}
+                    colSpan={visibleColumns.length + 1}
                     style={{
                       height: `${(dataRowCount - visibleEndIndex) * ROW_HEIGHT}px`,
                     }}
@@ -887,6 +1023,7 @@ export default function Home() {
               )}
             </tbody>
           </table>
+          {dataRowCount === 0 && <p className="px-6 py-12 text-sm text-muted-foreground">No rows match this view. Adjust the filters or clear the view.</p>}
         </div>
       </main>
     );

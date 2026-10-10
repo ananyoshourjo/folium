@@ -39,3 +39,10 @@ yarn-error.log*
 # typescript
 *.tsbuildinfo
 next-env.d.ts
+
+# Local research, browser verification, and agent tooling
+/output/
+/outputs/
+/.playwright-cli/
+/.agents/
+/skills-lock.json
